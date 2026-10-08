@@ -98,7 +98,8 @@
 const CONFIG = {
   client: "삼성하나로 구독",
   dailyUrl: "data/daily.csv",     // 매체별 일자 데이터 (SA 행이 없으면 키워드 데이터 합계를 SA로 사용)
-  keywordUrl: "data/keywords.csv" // 네이버 SA 키워드 데이터
+  keywordUrl: "data/keywords.csv", // 네이버 SA 키워드 데이터
+  gfaUrl: "data/gfa.csv"           // 네이버 GFA 보고서 (게재 위치 · 연령 및 성별 포함)
 };
 const MEDIA = [
   { id: "sa", name: "네이버 SA", color: "#2563eb", match: /sa|검색|파워링크/i },
@@ -112,6 +113,9 @@ const ALIAS = {
   date: ["date", "날짜", "일자", "일별", "기간"],
   media: ["media", "매체", "채널"],
   keyword: ["keyword", "키워드", "검색어"],
+  matchType: ["matchtype", "검색유형"],
+  placement: ["placement", "게재위치"],
+  demo: ["demo", "연령및성별"],
   spend: ["spend", "지출", "광고비", "비용", "총비용"],
   impressions: ["impressions", "노출", "노출수"],
   clicks: ["clicks", "link_clicks", "클릭", "클릭수", "링크클릭"],
@@ -166,7 +170,9 @@ async function loadCsv(url) {
     const o = {};
     fields.forEach((f, i) => { if (f) o[f] = r[i]; });
     const kw = String(o.keyword || "").trim();
-    const d = { date: normDate(o.date), keyword: kw === "-" ? "(키워드 없음)" : kw, media: o.media };
+    // 키워드가 "-" 인 행은 확장 검색 노출분
+    const d = { date: normDate(o.date), keyword: kw !== "-" ? kw : /확장/.test(o.matchType || "") ? "확장 검색" : "(키워드 없음)", media: o.media,
+      placement: String(o.placement || "").trim(), demo: String(o.demo || "").trim() };
     for (const k of ["spend", "impressions", "clicks", "conversions"]) d[k] = num(o[k]);
     return d;
   });
@@ -201,9 +207,9 @@ function delta(cur, prev, inverse) {
 }
 
 /* ---------- 상태 ---------- */
-let DAILY = [], KEYWORDS = [], KW_HAS_DATE = true, IS_SAMPLE = false;
+let DAILY = [], KEYWORDS = [], GFA = [], KW_HAS_DATE = true, IS_SAMPLE = false;
 let MIN = "", MAX = "";
-const state = { media: "all", chart: "vol", kwSort: "spend", kwDir: -1, kwQuery: "", kwLimit: 20, mdSort: "spend", mdDir: -1 };
+const state = { media: "all", chart: "vol", kwSort: "spend", kwDir: -1, kwQuery: "", kwLimit: 20, mdSort: "spend", mdDir: -1, dim: {} };
 let chart;
 
 function presetRange(p) {
@@ -267,6 +273,39 @@ function keywordHtml(R) {
     ${rows.length > shown.length ? `<button class="more" id="kwMore">더 보기 (${fmtN(rows.length - shown.length)}개 남음)</button>` : ""}`
     : `<div class="empty">해당 기간의 키워드 데이터가 없습니다.</div>`}
   </div>`;
+}
+
+// GFA 세부 표 (매체 그룹 · 게재위치 · 연령 · 성별)
+function ageOf(v) {
+  const m = v.match(/(\d+)세\s*~\s*(\d+)세/);
+  return !m ? "알 수 없음" : +m[2] >= 99 ? m[1] + "세 이상" : m[1] + "~" + m[2] + "세";
+}
+const sexOf = v => /여성/.test(v) ? "여성" : /남성/.test(v) ? "남성" : "알 수 없음";
+const DIMS = [
+  { id: "mg", title: "매체 그룹별 성과", label: "매체 그룹", key: r => r.placement.split(">")[0].trim() || "알 수 없음" },
+  { id: "pl", title: "게재위치별 성과", label: "게재위치", key: r => r.placement || "알 수 없음" },
+  { id: "age", title: "연령별 성과", label: "연령", key: r => ageOf(r.demo), sort: ["name", 1] },
+  { id: "sex", title: "성별 성과", label: "성별", key: r => sexOf(r.demo) },
+];
+const DIM_COLS = [
+  ["name", "", esc], ["spend", "지출", fmtW], ["share", "비중", fmtS], ["impressions", "노출", fmtN], ["clicks", "클릭", fmtN],
+  ["ctr", "CTR", fmtP], ["cpc", "CPC", fmtW], ["conversions", "전환수", fmtN], ["cpa", "CPA", fmtW],
+];
+function dimHtml(R) {
+  const src = GFA.filter(r => between(r, R.since, R.until));
+  if (!src.length) return GFA.length ? `<div class="card"><div class="empty">해당 기간의 GFA 세부 데이터가 없습니다.</div></div>` : "";
+  const tot = sum(src); tot.share = tot.spend ? 1 : 0;
+  return DIMS.map(d => {
+    const [sk, sd] = state.dim[d.id] || d.sort || ["spend", -1];
+    const by = {};
+    for (const r of src) { const k = d.key(r); (by[k] = by[k] || []).push(r); }
+    const rows = sortRows(Object.keys(by).map(k => { const s = sum(by[k]); return Object.assign(s, { name: k, share: tot.spend ? s.spend / tot.spend : 0 }); }), sk, sd);
+    const head = DIM_COLS.map(([k, l]) => `<th data-dim="${d.id}:${k}">${l || d.label}${sortMark(sk === k, sd)}</th>`).join("");
+    const body = rows.map(r => `<tr>${DIM_COLS.map(([k, , f]) => `<td>${f(r[k])}</td>`).join("")}</tr>`).join("");
+    const foot = `<tr>${DIM_COLS.map(([k, , f]) => `<td>${k === "name" ? "합계" : f(tot[k])}</td>`).join("")}</tr>`;
+    return `<div class="card"><h2>${d.title} <small>${R.since} ~ ${R.until}</small></h2>
+      <div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody><tfoot>${foot}</tfoot></table></div></div>`;
+  }).join("");
 }
 
 const MD_COLS = [
@@ -335,7 +374,7 @@ function render() {
     <div class="card"><h2>유입 추이
       <span class="grp">${modes.map(([k, l]) => `<button data-chart="${k}" class="${state.chart === k ? "on" : ""}">${l}</button>`).join("")}</span></h2>
       <div class="chart-box"><canvas id="trend"></canvas></div></div>` +
-    (showKw ? keywordHtml(R) : "") + mediaHtml(R);
+    (showKw ? keywordHtml(R) : "") + (state.media === "gfa" ? dimHtml(R) : "") + mediaHtml(R);
   drawChart(R, cur);
 }
 
@@ -353,11 +392,15 @@ for (const id of ["since", "until"]) document.getElementById(id).addEventListene
   document.getElementById("preset").value = "custom"; render();
 });
 document.addEventListener("click", e => {
-  const t = e.target.closest("[data-media],[data-chart],[data-kw],[data-md],#kwMore"); if (!t) return;
+  const t = e.target.closest("[data-media],[data-chart],[data-kw],[data-md],[data-dim],#kwMore"); if (!t) return;
   if (t.dataset.media) state.media = t.dataset.media;
   else if (t.dataset.chart) state.chart = t.dataset.chart;
   else if (t.dataset.kw) { const k = t.dataset.kw; if (state.kwSort === k) state.kwDir *= -1; else { state.kwSort = k; state.kwDir = k === "keyword" ? 1 : -1; } }
   else if (t.dataset.md) { const k = t.dataset.md; if (state.mdSort === k) state.mdDir *= -1; else { state.mdSort = k; state.mdDir = k === "name" ? 1 : -1; } }
+  else if (t.dataset.dim) {
+    const [id, k] = t.dataset.dim.split(":"), cur = state.dim[id] || DIMS.find(d => d.id === id).sort || ["spend", -1];
+    state.dim[id] = cur[0] === k ? [k, -cur[1]] : [k, k === "name" ? 1 : -1];
+  }
   else state.kwLimit += 30;
   render();
 });
@@ -389,8 +432,11 @@ document.getElementById("title").textContent = CONFIG.client + " 광고 리포�
     KEYWORDS = k.rows.filter(r => r.keyword && (!KW_HAS_DATE || r.date));
     // daily.csv에 SA 행이 없으면 키워드 데이터를 SA 일자 데이터로 사용
     if (KW_HAS_DATE && !DAILY.some(r => r.media === "sa")) DAILY = DAILY.concat(KEYWORDS.map(r => Object.assign({}, r, { media: "sa" })));
+    // daily.csv에 GFA 행이 없으면 GFA 보고서를 GFA 일자 데이터로 사용
+    try { const g = await loadCsv(CONFIG.gfaUrl); GFA = g.rows.filter(r => r.date); IS_SAMPLE = IS_SAMPLE || g.sample; } catch (e) { console.warn(e); }
+    if (!DAILY.some(r => r.media === "gfa")) DAILY = DAILY.concat(GFA.map(r => Object.assign({}, r, { media: "gfa" })));
     if (!DAILY.length) throw new Error("날짜가 있는 데이터가 없습니다");
-    IS_SAMPLE = d.sample || k.sample;
+    IS_SAMPLE = IS_SAMPLE || d.sample || k.sample;
     const dates = DAILY.map(r => r.date).sort();
     MIN = dates[0]; MAX = dates[dates.length - 1];
     for (const id of ["since", "until"]) { const el = document.getElementById(id); el.min = MIN; el.max = MAX; }
