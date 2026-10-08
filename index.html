@@ -58,6 +58,10 @@
   td:first-child { font-weight: 500; }
   tbody tr:hover { background: var(--soft); }
   tfoot td { font-weight: 700; background: var(--soft); border-bottom: none; }
+  tr.pick { cursor: pointer; }
+  tr.pick.on td { background: var(--accent-soft); color: var(--accent); font-weight: 700; }
+  .fbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; color: var(--muted); font-size: 13px; }
+  .chip { background: var(--accent-soft); color: var(--accent); border-color: transparent; border-radius: 999px; font-weight: 500; }
   .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; }
   .more { display: block; margin: 12px auto 0; color: var(--accent); }
   .empty { color: var(--muted); text-align: center; padding: 28px 0; }
@@ -114,6 +118,8 @@ const ALIAS = {
   media: ["media", "매체", "채널"],
   keyword: ["keyword", "키워드", "검색어"],
   matchType: ["matchtype", "검색유형"],
+  campaign: ["campaign", "캠페인", "캠페인이름"],
+  adgroup: ["adgroup", "광고그룹", "광고그룹이름"],
   placement: ["placement", "게재위치"],
   demo: ["demo", "연령및성별"],
   spend: ["spend", "지출", "광고비", "비용", "총비용"],
@@ -172,7 +178,8 @@ async function loadCsv(url) {
     const kw = String(o.keyword || "").trim();
     // 키워드가 "-" 인 행은 확장 검색 노출분
     const d = { date: normDate(o.date), keyword: kw !== "-" ? kw : /확장/.test(o.matchType || "") ? "확장 검색" : "(키워드 없음)", media: o.media,
-      placement: String(o.placement || "").trim(), demo: String(o.demo || "").trim() };
+      placement: String(o.placement || "").trim(), demo: String(o.demo || "").trim(),
+      campaign: String(o.campaign || "").trim(), adgroup: String(o.adgroup || "").trim() };
     for (const k of ["spend", "impressions", "clicks", "conversions"]) d[k] = num(o[k]);
     return d;
   });
@@ -209,7 +216,7 @@ function delta(cur, prev, inverse) {
 /* ---------- 상태 ---------- */
 let DAILY = [], KEYWORDS = [], GFA = [], KW_HAS_DATE = true, IS_SAMPLE = false;
 let MIN = "", MAX = "";
-const state = { media: "all", chart: "vol", kwSort: "spend", kwDir: -1, kwQuery: "", kwLimit: 20, mdSort: "spend", mdDir: -1, dim: {} };
+const state = { media: "all", chart: "vol", kwSort: "spend", kwDir: -1, kwQuery: "", kwLimit: 20, mdSort: "spend", mdDir: -1, dim: {}, flt: { sa: {}, gfa: {} } };
 let chart;
 
 function presetRange(p) {
@@ -252,7 +259,7 @@ const KW_COLS = [
   ["ctr", "CTR", fmtP], ["cpc", "CPC", fmtW], ["conversions", "전환수", fmtN], ["cpa", "CPA", fmtW],
 ];
 function keywordHtml(R) {
-  const src = KW_HAS_DATE ? KEYWORDS.filter(r => between(r, R.since, R.until)) : KEYWORDS;
+  const src = (KW_HAS_DATE ? KEYWORDS.filter(r => between(r, R.since, R.until)) : KEYWORDS).filter(r => state.media !== "sa" || pass(r));
   const by = {};
   for (const r of src) (by[r.keyword] = by[r.keyword] || []).push(r);
   let rows = Object.keys(by).map(k => Object.assign(sum(by[k]), { keyword: k }));
@@ -291,21 +298,46 @@ const DIM_COLS = [
   ["name", "", esc], ["spend", "지출", fmtW], ["share", "비중", fmtS], ["impressions", "노출", fmtN], ["clicks", "클릭", fmtN],
   ["ctr", "CTR", fmtP], ["cpc", "CPC", fmtW], ["conversions", "전환수", fmtN], ["cpa", "CPA", fmtW],
 ];
-function dimHtml(R) {
-  const src = GFA.filter(r => between(r, R.since, R.until));
-  if (!src.length) return GFA.length ? `<div class="card"><div class="empty">해당 기간의 GFA 세부 데이터가 없습니다.</div></div>` : "";
+// 캠페인 · 광고그룹 표: 행을 클릭하면 해당 캠페인/그룹 데이터만 보도록 필터
+const PICKS = [
+  { id: "camp", title: "캠페인별 성과", label: "캠페인", field: "campaign", key: r => r.campaign || "알 수 없음" },
+  { id: "grp", title: "광고그룹별 성과", label: "광고그룹", field: "adgroup", key: r => r.adgroup || "알 수 없음" },
+];
+const ALL_DIMS = PICKS.concat(DIMS);
+const flt = () => state.flt[state.media] || {};
+const pass = (r, onlyCampaign) => {
+  const f = flt();
+  return (!f.campaign || PICKS[0].key(r) === f.campaign) && (onlyCampaign || !f.adgroup || PICKS[1].key(r) === f.adgroup);
+};
+// 매체 탭의 세부 원본 (SA: 키워드 보고서, GFA: GFA 보고서)
+const detail = () => state.media === "sa" ? (KW_HAS_DATE ? KEYWORDS : []) : state.media === "gfa" ? GFA : [];
+
+function dimCard(d, src, R) {
+  const sel = d.field ? flt()[d.field] : null;
   const tot = sum(src); tot.share = tot.spend ? 1 : 0;
-  return DIMS.map(d => {
-    const [sk, sd] = state.dim[d.id] || d.sort || ["spend", -1];
-    const by = {};
-    for (const r of src) { const k = d.key(r); (by[k] = by[k] || []).push(r); }
-    const rows = sortRows(Object.keys(by).map(k => { const s = sum(by[k]); return Object.assign(s, { name: k, share: tot.spend ? s.spend / tot.spend : 0 }); }), sk, sd);
-    const head = DIM_COLS.map(([k, l]) => `<th data-dim="${d.id}:${k}">${l || d.label}${sortMark(sk === k, sd)}</th>`).join("");
-    const body = rows.map(r => `<tr>${DIM_COLS.map(([k, , f]) => `<td>${f(r[k])}</td>`).join("")}</tr>`).join("");
-    const foot = `<tr>${DIM_COLS.map(([k, , f]) => `<td>${k === "name" ? "합계" : f(tot[k])}</td>`).join("")}</tr>`;
-    return `<div class="card"><h2>${d.title} <small>${R.since} ~ ${R.until}</small></h2>
-      <div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody><tfoot>${foot}</tfoot></table></div></div>`;
-  }).join("");
+  const [sk, sd] = state.dim[d.id] || d.sort || ["spend", -1];
+  const by = {};
+  for (const r of src) { const k = d.key(r); (by[k] = by[k] || []).push(r); }
+  const rows = sortRows(Object.keys(by).map(k => { const s = sum(by[k]); return Object.assign(s, { name: k, share: tot.spend ? s.spend / tot.spend : 0 }); }), sk, sd);
+  const head = DIM_COLS.map(([k, l]) => `<th data-dim="${d.id}:${k}">${l || d.label}${sortMark(sk === k, sd)}</th>`).join("");
+  const body = rows.map(r => `<tr${d.field ? ` class="pick${sel === r.name ? " on" : ""}" data-pick="${d.field}" data-val="${esc(r.name)}"` : ""}>${DIM_COLS.map(([k, , f]) => `<td>${f(r[k])}</td>`).join("")}</tr>`).join("");
+  const foot = `<tr>${DIM_COLS.map(([k, , f]) => `<td>${k === "name" ? "합계" : f(tot[k])}</td>`).join("")}</tr>`;
+  return `<div class="card"><h2>${d.title} <small>${d.field ? "행을 클릭하면 해당 " + d.label + " 데이터만 표시됩니다" : R.since + " ~ " + R.until}</small></h2>
+    ${rows.length ? `<div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody><tfoot>${foot}</tfoot></table></div>` : `<div class="empty">해당 기간의 데이터가 없습니다.</div>`}</div>`;
+}
+function pickHtml(R) {
+  const src = detail().filter(r => between(r, R.since, R.until));
+  if (!detail().some(r => r.campaign || r.adgroup)) return "";
+  return dimCard(PICKS[0], src, R) + dimCard(PICKS[1], src.filter(r => pass(r, true)), R);
+}
+function dimHtml(R) {
+  const src = GFA.filter(r => between(r, R.since, R.until) && pass(r));
+  return GFA.length ? DIMS.map(d => dimCard(d, src, R)).join("") : "";
+}
+function filterHtml() {
+  const f = flt();
+  const chip = (k, l) => f[k] ? `<button class="chip" data-clear="${k}">${l}: ${esc(f[k])} ✕</button>` : "";
+  return f.campaign || f.adgroup ? `<div class="fbar">적용된 필터 ${chip("campaign", "캠페인")}${chip("adgroup", "광고그룹")}</div>` : "";
 }
 
 const MD_COLS = [
@@ -364,17 +396,19 @@ function render() {
   const R = range();
   document.getElementById("mediaTabs").innerHTML = [{ id: "all", name: "전체" }].concat(MEDIA)
     .map(m => `<button class="tab${state.media === m.id ? " on" : ""}" data-media="${esc(m.id)}">${esc(m.name)}</button>`).join("");
-  const cur = DAILY.filter(r => inMedia(r) && between(r, R.since, R.until));
-  const prev = DAILY.filter(r => inMedia(r) && between(r, R.pSince, R.pUntil));
+  // 캠페인/그룹 필터가 걸리면 세부 원본에서, 아니면 매체별 일자 데이터에서 집계
+  const f = flt(), base = f.campaign || f.adgroup ? detail().filter(r => pass(r)) : DAILY.filter(inMedia);
+  const cur = base.filter(r => between(r, R.since, R.until));
+  const prev = base.filter(r => between(r, R.pSince, R.pUntil));
   const showKw = state.media === "all" || state.media === "sa";
   const modes = [["vol", "노출·클릭"], ["ctr", "CTR"], ["cpc", "CPC"]];
   document.getElementById("content").innerHTML =
     (IS_SAMPLE ? `<div class="notice">⚠ 현재 화면은 <b>샘플 데이터</b>입니다. data 폴더의 CSV를 실제 데이터로 교체하면 이 안내는 사라집니다.</div>` : "") +
-    `<div class="kpis">${kpiHtml(sum(cur), sum(prev))}</div>
+    filterHtml() + `<div class="kpis">${kpiHtml(sum(cur), sum(prev))}</div>
     <div class="card"><h2>유입 추이
       <span class="grp">${modes.map(([k, l]) => `<button data-chart="${k}" class="${state.chart === k ? "on" : ""}">${l}</button>`).join("")}</span></h2>
       <div class="chart-box"><canvas id="trend"></canvas></div></div>` +
-    (showKw ? keywordHtml(R) : "") + (state.media === "gfa" ? dimHtml(R) : "") + mediaHtml(R);
+    pickHtml(R) + (showKw ? keywordHtml(R) : "") + (state.media === "gfa" ? dimHtml(R) : "") + mediaHtml(R);
   drawChart(R, cur);
 }
 
@@ -392,15 +426,22 @@ for (const id of ["since", "until"]) document.getElementById(id).addEventListene
   document.getElementById("preset").value = "custom"; render();
 });
 document.addEventListener("click", e => {
-  const t = e.target.closest("[data-media],[data-chart],[data-kw],[data-md],[data-dim],#kwMore"); if (!t) return;
+  const t = e.target.closest("[data-media],[data-chart],[data-kw],[data-md],[data-dim],[data-pick],[data-clear],#kwMore"); if (!t) return;
   if (t.dataset.media) state.media = t.dataset.media;
   else if (t.dataset.chart) state.chart = t.dataset.chart;
   else if (t.dataset.kw) { const k = t.dataset.kw; if (state.kwSort === k) state.kwDir *= -1; else { state.kwSort = k; state.kwDir = k === "keyword" ? 1 : -1; } }
   else if (t.dataset.md) { const k = t.dataset.md; if (state.mdSort === k) state.mdDir *= -1; else { state.mdSort = k; state.mdDir = k === "name" ? 1 : -1; } }
   else if (t.dataset.dim) {
-    const [id, k] = t.dataset.dim.split(":"), cur = state.dim[id] || DIMS.find(d => d.id === id).sort || ["spend", -1];
+    const [id, k] = t.dataset.dim.split(":"), cur = state.dim[id] || ALL_DIMS.find(d => d.id === id).sort || ["spend", -1];
     state.dim[id] = cur[0] === k ? [k, -cur[1]] : [k, k === "name" ? 1 : -1];
   }
+  else if (t.dataset.pick) {
+    const f = flt(), k = t.dataset.pick, v = t.dataset.val;
+    f[k] = f[k] === v ? null : v;
+    if (k === "campaign") f.adgroup = null;
+    state.kwLimit = 20;
+  }
+  else if (t.dataset.clear) { const f = flt(); f[t.dataset.clear] = null; if (t.dataset.clear === "campaign") f.adgroup = null; }
   else state.kwLimit += 30;
   render();
 });
